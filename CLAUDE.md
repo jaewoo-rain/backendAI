@@ -14,7 +14,7 @@ The owner builds this in numbered stages and verifies each stage before moving o
 
 Each stage's deliverable must be buildable and verifiable on its own.
 
-## Repository layout (current, Stage 6 + Stage 9 minimal)
+## Repository layout (current, Stage 6 + Stage 9 minimal + run-all orchestrator)
 
 - `hook/src/fgpu_hook.c` — the LD_PRELOAD hook. C, no C++ deps. Heavily commented in Korean for the owner. Hooks four things: Runtime alloc API (`cudaMalloc`/`cudaFree`), Driver alloc API (`cuMemAlloc_v2`/`cuMemFree_v2`, Stage 5-C), VMM API (`cuMemCreate`/`cuMemRelease`, Stage 6 — quota charged at physical alloc, VA reservation/mapping not hooked), and `cudaLaunchKernel` for monitoring (Stage 7). All alloc layers share `g_used`/`g_quota`/`g_lock`/`g_allocs`. A per-thread `__thread g_in_hook` flag prevents double-counting if one alloc API delegates to another and re-enters our hooks. The launch hook does NOT enforce quota — it only counts via lock-free `__atomic_fetch_add` and dumps the cumulative count every `FGPU_LAUNCH_LOG_EVERY` calls (default 1000) plus once on `atexit`.
 - `hook/tests/test_alloc.cu` — tiny standalone CUDA program that triggers `cudaMalloc` twice (256 MiB then 6 GiB) so a `FGPU_RATIO=0.4` run produces one ALLOW + one DENY in the log.
@@ -34,7 +34,7 @@ Each stage's deliverable must be buildable and verifiable on its own.
   - `app/services/session_manager.py` — Stage 8: SQLite-backed via `SessionStore`, no in-memory dict. All blocking calls (docker SDK + sqlite3) wrapped in `asyncio.to_thread()` so the event loop stays responsive — concurrent POST `/sessions` requests truly run in parallel. Reconciles status from docker daemon on every read; writes back any status change to SQLite.
   - `app/services/session_store.py` — Stage 8 persistence. stdlib `sqlite3` only (no new deps). Sync CRUD; SessionManager wraps each call in `to_thread`. New connection per call (sqlite3.Connection isn't thread-safe). `contextlib.closing` ensures connections are closed (the `with sqlite3.connect(...)` context manager handles transactions but doesn't close).
   - `app/schemas/session.py` — `Session`, `SessionCreate`, `SessionLogs` models. Stage 9 minimal added `gpu_index: Optional[int]` to both — `None` = all GPUs (default), `0/1/...` = pin to that device.
-  - `app/static/index.html` — Stage 5-B minimal UI. Vanilla JS + inline CSS, no build step. Served at `GET /` via `FileResponse` (no `StaticFiles` mount, since assets = 1 file).
+  - `app/static/index.html` — Stage 5-B minimal UI (extended for Stage 9 minimal). Vanilla JS + inline CSS, no build step. Served at `GET /` via `FileResponse` (no `StaticFiles` mount, since assets = 1 file). Toolbar has an API token input (saved to `localStorage`, auto-sent as `Authorization: Bearer <token>` on all fetches). Create form has `ratio`, `gpu_index` (optional, blank = all GPUs), `image`, `command` fields. Sessions table shows a `gpu` column (`all` or device id).
 - `scripts/build_hook.sh` — builds `build/libfgpu.so` with `gcc -shared -fPIC` against `/usr/local/cuda`.
 - `scripts/run_test.sh` — host-side: builds the test binary with `nvcc` and runs it twice (baseline + with LD_PRELOAD).
 - `scripts/build_image.sh` — `docker build` the runtime image (default tag `fgpu-runtime:stage2`).
@@ -44,6 +44,7 @@ Each stage's deliverable must be buildable and verifiable on its own.
 - `scripts/run_vmm_in_container.sh` — Stage 6 verification. Same baseline+hooked pattern as `run_driver_in_container.sh`, but the entrypoint is `/opt/fgpu/test_vmm_alloc` so only the VMM hook is exercised.
 - `scripts/run_backend.sh` — venv + `pip install -e .` + uvicorn on `:8000`. Sets `FGPU_HOST_HOOK_PATH` from `<repo>/build/libfgpu.so`.
 - `scripts/smoke_test_api.sh` — curl-based one-shot test of the full API loop (create → get → logs → delete).
+- `scripts/run_all_tests.sh` — orchestrator. Runs preflight → idempotent build → every per-stage smoke (1, 2, 5-C, 6, 7, 4, backend pytest) → spawn backend → 3, 5-A, 5-A correlation → 5-D → cleanup → PASS/FAIL summary table. Per-step logs under `experiments/runall_<TS>/<step>.log`. Exit 0 if all pass, 1 otherwise. Handles ALLOC sizing for ≥8 GB GPUs (default 6144 MiB → OOM at ratio 0.4 quota).
 - `runtime-image-pytorch/Dockerfile` — Stage 4 variant. `FROM fgpu-runtime:stage2`, adds `python3` + PyTorch (cu121 wheel). Sets `PYTORCH_NO_CUDA_MEMORY_CACHING=1` as default ENV so caching allocator doesn't mask the hook. Inherits the base image's `ENTRYPOINT`; default `CMD` runs `test_pytorch.py`.
 - `runtime-image-pytorch/test_pytorch.py` — allocates a small (256 MiB) then a large (4 GiB) `torch.empty` on `cuda:0` and synchronizes, so `OutOfMemoryError` from the hook is observable. Sizes overridable via `PYTEST_ALLOC1_MIB` / `PYTEST_ALLOC2_MIB`.
 - `runtime-image-pytorch/test_compute.py` — 5-A correlation extension workload. Allocates `ALLOC_MIB` then runs a matmul + relu + scale loop for `HOLD_SEC` seconds (each iter = several `cudaLaunchKernel` calls so the Stage 7 counter advances quickly), then frees. Used to generate combined (memory + launch frequency) traces.
@@ -55,6 +56,7 @@ Each stage's deliverable must be buildable and verifiable on its own.
 - `scripts/eval/run_correlation.sh` — 5-A correlation extension. Spawns two PyTorch sessions running `test_compute.py` with different ratios, captures `nvidia-smi` memory + container PIDs (`docker top`) + timestamped logs (`docker logs --timestamps`). Calls `_correlate.py` to join everything into `correlation.csv` (long format: `t_seconds, container, launch_count, used_memory_mib`). Designed for two containers that *coexist* under quota — set `ALLOC_MIB=4096` to recreate 5-A's OOM scenario instead.
 - `scripts/eval/_correlate.py` — post-processing helper invoked by `run_correlation.sh`. stdlib only; parses ISO8601 docker timestamps + `nvidia-smi` CSV format, joins by PID set per container, emits `correlation.csv` and `correlation_summary.txt`.
 - `description.md` — long-form architecture / rationale doc, Korean. Read this for the *why*.
+- `LINUX_SETUP.md` — end-to-end first-run runbook for a fresh Ubuntu / RTX 4070 machine after `git clone`. Driver / CUDA / Docker / nvidia-container-toolkit setup, build, per-stage PASS criteria, troubleshooting table. Use when guiding the user through environment migration.
 
 The Stage 3 backend supports Stage 4 with **zero code changes** — `SessionCreate` already accepts an `image` field, and `DockerManager.create_container` honors it. So `POST /sessions` with `{"ratio":0.4,"image":"fgpu-runtime-pytorch:stage4","command":["python3","/opt/fgpu/test_pytorch.py"]}` works as-is.
 
@@ -115,6 +117,9 @@ FGPU_RATIO=0.6 ./scripts/run_driver_in_container.sh   # 6 GiB still DENY (quota 
 PYTEST_LAUNCH_N=10000 FGPU_LAUNCH_LOG_EVERY=1000 \
     ./scripts/run_launch_in_container.sh                        # heavier launch volume
 FGPU_LAUNCH_LOG_EVERY=0 ./scripts/run_launch_in_container.sh    # log off — for re-running 5-D overhead
+
+# One-shot — every stage at once (recommended)
+./scripts/run_all_tests.sh                     # → PASS/FAIL summary + experiments/runall_<TS>/
 
 # Stage 8 — SQLite persistence + asyncio.to_thread wrapping
 # (backend code only — no rebuild needed; uvicorn --reload picks it up)

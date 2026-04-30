@@ -69,12 +69,32 @@ Two key design decisions:
 > CUDA-on-WSL2; Docker Desktop's WSL2 backend or `docker-ce` installed
 > inside WSL2 both work.
 
+> **First time on a fresh Linux machine?** See
+> [`LINUX_SETUP.md`](LINUX_SETUP.md) for an end-to-end setup +
+> per-stage verification runbook with PASS criteria and a
+> troubleshooting table.
+
 ---
 
 ## Quick start
 
+### One-shot verification (recommended on a fresh machine)
+
 ```bash
-# 1) build the hook .so
+chmod +x scripts/*.sh scripts/eval/*.sh runtime-image/entrypoint.sh
+./scripts/run_all_tests.sh
+```
+
+Builds everything that's missing, runs every stage's verification, and
+prints a `PASS / FAIL` summary. Per-step logs land under
+`experiments/runall_<TS>/`. First run takes ~10 minutes (PyTorch image
+build); later runs ~5 minutes. Backend is spawned + killed inside the
+script — for actual UI / demo use see "Daily use" below.
+
+### Daily use (running the backend + browser UI)
+
+```bash
+# 1) build the hook .so (only needed once or after editing the hook)
 ./scripts/build_hook.sh                 # → build/libfgpu.so
 
 # 2) build the runtime base image (compiles bench + smoke binaries)
@@ -83,16 +103,19 @@ Two key design decisions:
 # 3) build the PyTorch variant (~5 GB wheel pull on first run)
 ./scripts/build_pytorch_image.sh        # → fgpu-runtime-pytorch:stage4
 
-# 4) run the backend
+# 4) run the backend (foreground; Ctrl+C to stop)
 ./scripts/run_backend.sh                # uvicorn on :8000
-# open http://localhost:8000/  in a browser
 
-# 5) sanity-check via curl
+# 5) sanity-check via curl (in another shell)
 ./scripts/smoke_test_api.sh             # POST → GET → logs → DELETE
 ```
 
 The bundled web UI at `http://localhost:8000/` lets you create / inspect /
-delete sessions interactively.
+delete sessions interactively, including a `gpu_index` field for
+multi-GPU device pinning and a token toolbar for bearer-auth mode.
+
+> Accessing port 8000 from a different machine? Open the firewall on
+> the host: `sudo ufw allow 8000/tcp`.
 
 ---
 
@@ -148,6 +171,11 @@ delete sessions interactively.
 
 Each experiment writes its artifacts under `experiments/<name>_<timestamp>/`.
 `experiments/` is git-ignored.
+
+`./scripts/run_all_tests.sh` already runs every step below as part of
+its verification pass and dumps the same artifacts. The list below is
+for manual / one-stage-at-a-time invocation (debugging a single failed
+stage, sweeping ratios, etc.):
 
 ```bash
 # memory quota — host-only (Stage 1)

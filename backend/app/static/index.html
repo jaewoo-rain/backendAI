@@ -56,11 +56,23 @@
   <h1>fGPU Sessions</h1>
   <p class="muted" id="health-line">healthz …</p>
 
+  <div class="toolbar">
+    <label>API token (auth on 일 때만 필요)
+      <input id="token-input" type="password" class="image"
+             placeholder="비어있으면 인증 비활성 가정" />
+    </label>
+    <button id="token-save">save</button>
+    <span class="muted" id="token-status"></span>
+  </div>
+
   <h2>Create</h2>
   <form id="create-form">
     <div class="row">
       <label>ratio (0&lt;r≤1)
         <input name="ratio" type="number" step="0.05" min="0.05" max="1" value="0.4" required />
+      </label>
+      <label>gpu_index (멀티-GPU, 빈 값 = 모든 GPU)
+        <input name="gpu_index" type="number" min="0" step="1" placeholder="" />
       </label>
       <label>image
         <input name="image" class="image" value="fgpu-runtime-pytorch:stage4" />
@@ -81,11 +93,11 @@
   <table>
     <thead>
       <tr>
-        <th>id</th><th>image</th><th>ratio</th><th>status</th>
+        <th>id</th><th>image</th><th>ratio</th><th>gpu</th><th>status</th>
         <th>exit</th><th>created</th><th>actions</th>
       </tr>
     </thead>
-    <tbody id="sessions-tbody"><tr><td colspan="7" class="muted">…</td></tr></tbody>
+    <tbody id="sessions-tbody"><tr><td colspan="8" class="muted">…</td></tr></tbody>
   </table>
 
   <h2>Logs <span class="muted" id="logs-of"></span></h2>
@@ -100,16 +112,28 @@
 const $ = (sel) => document.querySelector(sel);
 let selectedSid = null;
 
+// ---- token (Stage 9 minimal — auth on 일 때 사용) -------------------------
+const TOKEN_KEY = 'fgpu_api_token';
+function getToken() { return localStorage.getItem(TOKEN_KEY) || ''; }
+function setToken(t) {
+  if (t) localStorage.setItem(TOKEN_KEY, t);
+  else   localStorage.removeItem(TOKEN_KEY);
+}
+function authHeaders() {
+  const t = getToken();
+  return t ? { 'Authorization': `Bearer ${t}` } : {};
+}
+
 // ---- helpers --------------------------------------------------------------
 async function jget(url) {
-  const r = await fetch(url);
+  const r = await fetch(url, { headers: authHeaders() });
   if (!r.ok) throw new Error(`${url} → ${r.status}`);
   return r.json();
 }
 async function jpost(url, body) {
   const r = await fetch(url, {
     method: 'POST',
-    headers: {'Content-Type': 'application/json'},
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: body == null ? null : JSON.stringify(body),
   });
   if (!r.ok) {
@@ -119,7 +143,7 @@ async function jpost(url, body) {
   return r.json();
 }
 async function jdelete(url) {
-  const r = await fetch(url, {method: 'DELETE'});
+  const r = await fetch(url, { method: 'DELETE', headers: authHeaders() });
   if (!r.ok) throw new Error(`${url} → ${r.status}`);
   return r.json();
 }
@@ -137,9 +161,24 @@ const escapeHtml = (s) =>
 async function refreshHealth() {
   try {
     const h = await jget('/healthz');
+    const auth = h.auth_enabled ? ' [auth ON]' : ' [auth off]';
     $('#health-line').textContent =
       `healthz: ok=${h.ok}  runtime_image=${h.runtime_image}  ` +
-      `host_hook_exists=${h.host_hook_exists}`;
+      `host_hook_exists=${h.host_hook_exists}` + auth;
+    // 토큰 상태 표시
+    const have = !!getToken();
+    if (h.auth_enabled && !have) {
+      $('#token-status').textContent = '⚠ auth ON 인데 토큰 미저장 → 401 발생';
+      $('#token-status').className = 'err';
+    } else if (h.auth_enabled && have) {
+      $('#token-status').textContent = '✓ 토큰 저장됨, 모든 API 호출에 첨부';
+      $('#token-status').className = 'muted';
+    } else if (!h.auth_enabled && have) {
+      $('#token-status').textContent = '(auth off — 토큰은 무시됨)';
+      $('#token-status').className = 'muted';
+    } else {
+      $('#token-status').textContent = '';
+    }
   } catch (e) {
     $('#health-line').innerHTML = `<span class="err">healthz failed: ${escapeHtml(e.message)}</span>`;
   }
@@ -153,10 +192,12 @@ function renderRow(s) {
   const exitClass = s.exit_code === 0 ? 'exit-zero' :
                     (s.exit_code != null ? 'exit-nonzero' : '');
   const exitTxt = s.exit_code == null ? '' : s.exit_code;
+  const gpuTxt = (s.gpu_index == null) ? 'all' : s.gpu_index;
   tr.innerHTML = `
     <td><code>${escapeHtml(s.id)}</code></td>
     <td>${escapeHtml(s.image)}</td>
     <td>${s.ratio}</td>
+    <td>${escapeHtml(String(gpuTxt))}</td>
     <td class="status-${escapeHtml(s.status)}">${escapeHtml(s.status)}</td>
     <td class="${exitClass}">${escapeHtml(String(exitTxt))}</td>
     <td>${escapeHtml(fmtTime(s.created_at))}</td>
@@ -173,13 +214,13 @@ async function refreshSessions() {
     sessions = await jget('/sessions');
   } catch (e) {
     $('#sessions-tbody').innerHTML =
-      `<tr><td colspan="7" class="err">${escapeHtml(e.message)}</td></tr>`;
+      `<tr><td colspan="8" class="err">${escapeHtml(e.message)}</td></tr>`;
     return;
   }
   const tbody = $('#sessions-tbody');
   tbody.innerHTML = '';
   if (sessions.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="7" class="muted">(no sessions)</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" class="muted">(no sessions)</td></tr>`;
   } else {
     // 최신이 위로
     sessions.sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
@@ -215,9 +256,11 @@ $('#create-form').addEventListener('submit', async (ev) => {
   const ratio = Number(fd.get('ratio'));
   const image = String(fd.get('image') || '').trim();
   const cmdStr = String(fd.get('command') || '').trim();
+  const gpuStr = String(fd.get('gpu_index') || '').trim();
   const payload = { ratio };
   if (image) payload.image = image;
   if (cmdStr) payload.command = cmdStr.split(/\s+/);
+  if (gpuStr !== '') payload.gpu_index = Number(gpuStr);
   try {
     const created = await jpost('/sessions', payload);
     selectSession(created.id);
@@ -225,6 +268,14 @@ $('#create-form').addEventListener('submit', async (ev) => {
     $('#create-err').hidden = false;
     $('#create-err').textContent = e.message;
   }
+});
+
+// ---- token toolbar -------------------------------------------------------
+$('#token-input').value = getToken();
+$('#token-save').addEventListener('click', () => {
+  setToken($('#token-input').value.trim());
+  refreshHealth();
+  refreshSessions();
 });
 
 // ---- table delegation: click row → select; click action button → act ------

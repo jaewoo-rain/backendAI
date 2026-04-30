@@ -306,6 +306,11 @@ FGPU_QUOTA_BYTES=$((512*1024*1024)) ./scripts/run_test.sh   # 512 MiB
 
 `backend/app/static/index.html` 단일 파일. 빌드 스텝 0, 외부 의존성 0 (vanilla JS + 인라인 CSS). `GET /` 에 `FileResponse` 로 직접 반환. 폼 → 세션 테이블 (3초 폴링) → 로그 패널 → Stop·Delete. 캡스톤 시연용 최소 UI 로 충분 (논문 본문에서는 스크린샷 한 장).
 
+Stage 9 minimal 도입 후 두 필드 추가:
+
+- **API token toolbar** — password 입력 + save 버튼. `localStorage` 에 저장, 모든 fetch 가 자동으로 `Authorization: Bearer <token>` 첨부. `auth_enabled` 가 healthz 에서 true 인데 토큰 미저장이면 빨간 경고 메시지.
+- **`gpu_index` 입력란** — Create 폼의 number input. 빈 값 = `--gpus all` (기본), 정수 N = `--gpus device=N`. 세션 테이블에도 `gpu` 컬럼 추가 (`all` 또는 device id).
+
 ### 10.6 Stage 5-C — Driver API hook
 
 `hook/src/fgpu_hook.c` 에 `cuMemAlloc_v2` / `cuMemFree_v2` 두 hook 추가. Runtime API 와 같은 `g_used`/`g_quota`/`g_lock`/`g_allocs` 를 공유. 핵심 디자인 결정:
@@ -405,6 +410,27 @@ PyTorch caching allocator 를 거치지 않는 *raw* cudaMalloc 측정이 핵심
 - **Token 회전 / RBAC / Redis 백업 store** 는 *의도적으로 미구현* — single static token + SQLite single-host 가 prototype scope. Stage 9 (full) 에서 OAuth/JWT/Redis adapter.
 
 논문 의의: 캡스톤 시연 시 "auth 없는 데모" 와 "토큰 보호 데모" 를 한 명령으로 토글 가능. 평가 섹션의 *시스템 안전성* 측면을 채워줌 — 본격 RBAC 까진 아니지만 "API 가 protected mode 를 지원한다" 명제는 입증.
+
+### 10.7-sextes 자동화 도구 — `run_all_tests.sh`
+
+캡스톤 / 논문 마무리 단계에서 *전체 stage* 가 GPU 머신에서 정상 동작함을 한 번에 증명할 필요가 생긴다. 매번 9~10 개 스크립트를 손으로 돌리는 건 실수와 누락의 원인이라, 단일 orchestrator 를 도입.
+
+`scripts/run_all_tests.sh` 가 다음을 자동 수행:
+
+1. **Preflight** — `nvidia-smi` + `docker run --gpus all` 응답 확인. 실패 시 LINUX_SETUP.md §2/§3 으로 안내하며 즉시 종료.
+2. **Idempotent build** — `build/libfgpu.so` / `fgpu-runtime:stage2` / `fgpu-runtime-pytorch:stage4` 가 없을 때만 빌드.
+3. **Backend-less stage 검증** — Stage 1, 2, 5-C, 6, 7, 4 + backend pytest. 각자 컨테이너에서 단독 실행, hook stderr 의 ALLOW/DENY/exit-summary 패턴 grep 으로 PASS 판정.
+4. **Backend lifecycle** — `FGPU_LAUNCH_LOG_EVERY=500` 으로 spawn → `/healthz` 30초 polling → Stage 3 smoke + 5-A isolation + 5-A correlation + 5-D overhead → trap 으로 자동 kill.
+5. **Per-step 로그 분리 캡처** — 각 단계의 stdout+stderr 가 `experiments/runall_<TS>/<step>.log` 에 분리. fail 시 그 로그 한 파일만 보면 디버깅 가능.
+6. **PASS/FAIL 표 + 종료 코드** — 0 = 모두 통과, 1 = 하나 이상 실패.
+
+핵심 디자인 결정:
+
+- **`set -e` 안 씀**. 한 단계 실패해도 나머지 진행 — 한 번 돌릴 때 최대 정보 수집. 캡스톤 마지막에 "어디까지 망가졌는지" 빠르게 진단 가능.
+- **GPU 메모리 6 GiB 가정 (4070, 12 GB)**. ALLOC=6144 MiB 로 OOM 분기를 강제. 8 GB GPU 에서도 quota 0.4 의 3.2 GiB 초과라 동일하게 PASS, 더 작은 GPU 면 사용자가 env override.
+- **백엔드 직접 spawn / kill** — 사용자가 별도 셸로 띄우는 부담 제거. 단, `run_all_tests.sh` 가 끝나면 백엔드도 죽으므로 *실제 UI 시연용* 으론 별도 `run_backend.sh` 필요.
+
+논문 의의: §9 의 6개 실험 항목이 단일 명령으로 재현 가능 (`./scripts/run_all_tests.sh`). 캡스톤 시연 직전 또는 다른 GPU 머신으로 옮겼을 때 sanity check 로 사용. 결과의 일부 (5-A summary.txt, 5-D summary.csv, correlation.csv) 가 그대로 paper figure 의 입력.
 
 ### 10.8 평가 실험 항목 ↔ 실제 산출물 매핑
 
