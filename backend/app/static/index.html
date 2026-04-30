@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <title>fGPU Sessions</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    /* Stage 5-B: 의도적으로 단순한 스타일. 캡스톤 시연용 최소 UI. */
+    :root { color-scheme: light dark; }
+    body {
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      max-width: 1100px;
+      margin: 1.5rem auto;
+      padding: 0 1rem;
+      line-height: 1.45;
+    }
+    h1 { margin: 0 0 0.25rem 0; }
+    h2 { margin-top: 2rem; }
+    .muted { opacity: 0.7; font-size: 0.9em; }
+    .row { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: end; }
+    label { display: flex; flex-direction: column; font-size: 0.85em; }
+    input, button, select, textarea {
+      font: inherit;
+      padding: 0.35rem 0.5rem;
+    }
+    input[type=number] { width: 6rem; }
+    input.image, input.command { min-width: 22rem; }
+    table {
+      border-collapse: collapse; width: 100%; margin-top: 0.75rem;
+      font-size: 0.92em;
+    }
+    th, td { border: 1px solid #8884; padding: 0.35rem 0.5rem; text-align: left; }
+    tbody tr { cursor: pointer; }
+    tbody tr:hover { background: #8881; }
+    tbody tr.selected { background: #4a90e22a; }
+    .status-running  { color: #2a7;   }
+    .status-exited   { color: #888;   }
+    .status-created  { color: #888;   }
+    .status-removed  { color: #c33;   }
+    .exit-zero    { color: #2a7; }
+    .exit-nonzero { color: #c33; }
+    pre.logs {
+      background: #0001;
+      padding: 0.6rem;
+      max-height: 26rem;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .err { color: #c33; }
+    button.danger { color: #c33; }
+    .toolbar { display: flex; gap: 0.5rem; flex-wrap: wrap; margin: 0.5rem 0; }
+  </style>
+</head>
+<body>
+  <h1>fGPU Sessions</h1>
+  <p class="muted" id="health-line">healthz …</p>
+
+  <h2>Create</h2>
+  <form id="create-form">
+    <div class="row">
+      <label>ratio (0&lt;r≤1)
+        <input name="ratio" type="number" step="0.05" min="0.05" max="1" value="0.4" required />
+      </label>
+      <label>image
+        <input name="image" class="image" value="fgpu-runtime-pytorch:stage4" />
+      </label>
+      <label>command (whitespace-split, empty = image default)
+        <input name="command" class="command" placeholder="python3 /opt/fgpu/test_hold.py" />
+      </label>
+      <button type="submit">create</button>
+    </div>
+    <p id="create-err" class="err" hidden></p>
+  </form>
+
+  <h2>Sessions <span class="muted" id="poll-info">(auto-refresh 3s)</span></h2>
+  <div class="toolbar">
+    <button id="refresh-btn">refresh</button>
+    <span class="muted" id="last-refresh"></span>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>id</th><th>image</th><th>ratio</th><th>status</th>
+        <th>exit</th><th>created</th><th>actions</th>
+      </tr>
+    </thead>
+    <tbody id="sessions-tbody"><tr><td colspan="7" class="muted">…</td></tr></tbody>
+  </table>
+
+  <h2>Logs <span class="muted" id="logs-of"></span></h2>
+  <div class="toolbar">
+    <button id="logs-refresh-btn" disabled>refresh logs</button>
+  </div>
+  <pre class="logs" id="logs-pane">(세션을 클릭하면 tail 로그를 표시)</pre>
+
+<script>
+"use strict";
+
+const $ = (sel) => document.querySelector(sel);
+let selectedSid = null;
+
+// ---- helpers --------------------------------------------------------------
+async function jget(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url} → ${r.status}`);
+  return r.json();
+}
+async function jpost(url, body) {
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: body == null ? null : JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error(`${url} → ${r.status}: ${txt}`);
+  }
+  return r.json();
+}
+async function jdelete(url) {
+  const r = await fetch(url, {method: 'DELETE'});
+  if (!r.ok) throw new Error(`${url} → ${r.status}`);
+  return r.json();
+}
+const fmtTime = (iso) => {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return d.toLocaleTimeString();
+};
+const escapeHtml = (s) =>
+  String(s).replace(/[&<>"']/g, (c) => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+
+// ---- healthz --------------------------------------------------------------
+async function refreshHealth() {
+  try {
+    const h = await jget('/healthz');
+    $('#health-line').textContent =
+      `healthz: ok=${h.ok}  runtime_image=${h.runtime_image}  ` +
+      `host_hook_exists=${h.host_hook_exists}`;
+  } catch (e) {
+    $('#health-line').innerHTML = `<span class="err">healthz failed: ${escapeHtml(e.message)}</span>`;
+  }
+}
+
+// ---- sessions list --------------------------------------------------------
+function renderRow(s) {
+  const tr = document.createElement('tr');
+  tr.dataset.sid = s.id;
+  if (s.id === selectedSid) tr.classList.add('selected');
+  const exitClass = s.exit_code === 0 ? 'exit-zero' :
+                    (s.exit_code != null ? 'exit-nonzero' : '');
+  const exitTxt = s.exit_code == null ? '' : s.exit_code;
+  tr.innerHTML = `
+    <td><code>${escapeHtml(s.id)}</code></td>
+    <td>${escapeHtml(s.image)}</td>
+    <td>${s.ratio}</td>
+    <td class="status-${escapeHtml(s.status)}">${escapeHtml(s.status)}</td>
+    <td class="${exitClass}">${escapeHtml(String(exitTxt))}</td>
+    <td>${escapeHtml(fmtTime(s.created_at))}</td>
+    <td>
+      <button data-action="stop"   data-sid="${escapeHtml(s.id)}">stop</button>
+      <button data-action="delete" data-sid="${escapeHtml(s.id)}" class="danger">delete</button>
+    </td>
+  `;
+  return tr;
+}
+async function refreshSessions() {
+  let sessions;
+  try {
+    sessions = await jget('/sessions');
+  } catch (e) {
+    $('#sessions-tbody').innerHTML =
+      `<tr><td colspan="7" class="err">${escapeHtml(e.message)}</td></tr>`;
+    return;
+  }
+  const tbody = $('#sessions-tbody');
+  tbody.innerHTML = '';
+  if (sessions.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="7" class="muted">(no sessions)</td></tr>`;
+  } else {
+    // 최신이 위로
+    sessions.sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
+    for (const s of sessions) tbody.appendChild(renderRow(s));
+  }
+  $('#last-refresh').textContent = `updated ${new Date().toLocaleTimeString()}`;
+}
+
+// ---- logs -----------------------------------------------------------------
+async function refreshLogs() {
+  if (!selectedSid) return;
+  try {
+    const r = await jget(`/sessions/${encodeURIComponent(selectedSid)}/logs`);
+    $('#logs-pane').textContent = r.logs || '(empty)';
+  } catch (e) {
+    $('#logs-pane').textContent = `logs failed: ${e.message}`;
+  }
+}
+function selectSession(sid) {
+  selectedSid = sid;
+  $('#logs-of').textContent = sid ? `— ${sid}` : '';
+  $('#logs-refresh-btn').disabled = !sid;
+  // 선택 표시 갱신은 다음 list refresh 에서. 즉시 반영을 위해 한번 호출.
+  refreshSessions();
+  refreshLogs();
+}
+
+// ---- create ---------------------------------------------------------------
+$('#create-form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  $('#create-err').hidden = true;
+  const fd = new FormData(ev.target);
+  const ratio = Number(fd.get('ratio'));
+  const image = String(fd.get('image') || '').trim();
+  const cmdStr = String(fd.get('command') || '').trim();
+  const payload = { ratio };
+  if (image) payload.image = image;
+  if (cmdStr) payload.command = cmdStr.split(/\s+/);
+  try {
+    const created = await jpost('/sessions', payload);
+    selectSession(created.id);
+  } catch (e) {
+    $('#create-err').hidden = false;
+    $('#create-err').textContent = e.message;
+  }
+});
+
+// ---- table delegation: click row → select; click action button → act ------
+$('#sessions-tbody').addEventListener('click', async (ev) => {
+  const btn = ev.target.closest('button[data-action]');
+  if (btn) {
+    ev.stopPropagation();
+    const sid = btn.dataset.sid;
+    const action = btn.dataset.action;
+    btn.disabled = true;
+    try {
+      if (action === 'stop') {
+        await jpost(`/sessions/${encodeURIComponent(sid)}/stop`);
+      } else if (action === 'delete') {
+        await jdelete(`/sessions/${encodeURIComponent(sid)}`);
+        if (sid === selectedSid) selectSession(null);
+      }
+    } catch (e) {
+      alert(e.message);
+    }
+    await refreshSessions();
+    return;
+  }
+  const tr = ev.target.closest('tr[data-sid]');
+  if (tr) selectSession(tr.dataset.sid);
+});
+
+$('#refresh-btn').addEventListener('click', refreshSessions);
+$('#logs-refresh-btn').addEventListener('click', refreshLogs);
+
+// ---- init + polling -------------------------------------------------------
+refreshHealth();
+refreshSessions();
+setInterval(refreshSessions, 3000);
+setInterval(() => { if (selectedSid) refreshLogs(); }, 3000);
+</script>
+</body>
+</html>

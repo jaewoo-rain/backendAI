@@ -1,0 +1,30 @@
+# Build artifacts
+build/
+
+# Persisted runtime state (Stage 8 — sessions.db, etc.)
+data/
+
+# Experiment outputs (Stage 5-A, 5-D and beyond)
+experiments/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+.python-version
+
+# Local config
+.env
+.env.local
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
